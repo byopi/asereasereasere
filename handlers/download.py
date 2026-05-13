@@ -83,15 +83,40 @@ async def _process_single(bot: Client, user: Client, original_msg: Message, stat
         await _safe_edit(status_msg, f"{pfx}⚡ Restringido. Transfiriendo vía Pipe...")
         await _stream_and_send(bot, user, original_msg, status_msg, src, pfx)
 
-async def _stream_and_send(bot: Client, user: Client, original_msg: Message, status_msg: Message, src: Message, pfx: str) -> None:
+async def _stream_and_send(
+    bot: Client,
+    user: Client,
+    original_msg: Message,
+    status_msg: Message,
+    src: Message,
+    pfx: str,
+) -> None:
     total_size = _get_media_size(src)
     file_name = _get_media_name(src) or f"file_{src.id}"
     tracker = ProgressTracker(total_size, status_msg, pfx, PROGRESS_UPDATE_INTERVAL)
     
+    # Creamos la tubería
     r, w = os.pipe()
     reader = os.fdopen(r, "rb")
     writer = os.fdopen(w, "wb")
-    setattr(reader, "name", file_name)
+
+    # --- CLASE PROXY PARA HACER EL NOMBRE ESCRIBIBLE ---
+    class FileProxy:
+        def __init__(self, file_obj, custom_name):
+            self._file = file_obj
+            self.name = custom_name # Aquí sí es escribible
+
+        def __getattr__(self, attr):
+            return getattr(self._file, attr)
+            
+        def read(self, *args, **kwargs):
+            return self._file.read(*args, **kwargs)
+
+        def close(self):
+            return self._file.close()
+
+    # Envolvemos el lector en el proxy
+    readable_proxy = FileProxy(reader, file_name)
 
     async def download():
         try:
@@ -100,19 +125,25 @@ async def _stream_and_send(bot: Client, user: Client, original_msg: Message, sta
                     writer.write(chunk)
                     await tracker.update(len(chunk))
             writer.flush()
+        except Exception as e:
+            logger.error(f"Error descargando: {e}")
         finally:
             writer.close()
 
     async def upload():
         try:
-            await _dispatch_media(bot, original_msg.chat.id, src, reader, src.caption or "")
+            # Pasamos el proxy en lugar del reader original
+            await _dispatch_media(bot, original_msg.chat.id, src, readable_proxy, src.caption or "")
+        except Exception as e:
+            logger.error(f"Error subiendo: {e}")
         finally:
-            reader.close()
+            readable_proxy.close()
 
     try:
         await asyncio.gather(download(), upload())
         await _safe_edit(status_msg, f"{pfx}✅ `{file_name}` enviado.")
     except Exception as e:
+        logger.error(f"Error en transferencia: {e}")
         await _safe_edit(status_msg, f"{pfx}❌ Error: `{e}`")
 
 async def _dispatch_media(bot: Client, chat_id: int, src: Message, fp, caption: str) -> None:

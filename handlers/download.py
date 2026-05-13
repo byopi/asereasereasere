@@ -11,7 +11,7 @@ Gestión de memoria (por qué no hay OOM con archivos grandes):
   seek(0) y se pasa a send_document/send_video/etc.
 
   ┌─────────────────────────────────────────────────────────────┐
-  │  RAM usada ≈ tamaño del archivo + overhead de Pyrogram       │
+  │  RAM usada ≈ tamaño del archivo + overhead de Pyrogram      │
   │  Disco usado = 0 bytes (nunca se llama a open())            │
   └─────────────────────────────────────────────────────────────┘
 
@@ -37,6 +37,7 @@ from pyrogram.errors import (
     ChannelPrivate,
     ChatForwardsRestricted,
     MessageNotModified,
+    PeerIdInvalid,
 )
 from pyrogram.types import Message
 
@@ -164,8 +165,8 @@ async def _process_single(
     # ── Obtener el mensaje con el cliente de usuario ───────────────────────
     try:
         src = await _get_message_with_retry(user, chat_id, msg_id)
-    except (MessageIdInvalid, ChannelPrivate) as e:
-        await _safe_edit(status_msg, f"{pfx}❌ Sin acceso al mensaje `{msg_id}`: {e}")
+    except (MessageIdInvalid, ChannelPrivate, PeerIdInvalid) as e:
+        await _safe_edit(status_msg, f"{pfx}❌ Sin acceso al canal o mensaje `{msg_id}`: {e}")
         return
 
     if src is None:
@@ -305,6 +306,13 @@ async def _get_message_with_retry(
     max_retries: int = 3,
 ) -> Optional[Message]:
     """Obtiene un mensaje con reintentos y backoff exponencial para FloodWait."""
+    
+    # --- FIX PARA PEER_ID_INVALID: Forzar al cliente a reconocer el chat ---
+    try:
+        await user.get_chat(chat_id)
+    except Exception as e:
+        logger.debug("No se pudo pre-obtener chat %s: %s", chat_id, e)
+
     for attempt in range(max_retries):
         try:
             return await user.get_messages(chat_id, msg_id)

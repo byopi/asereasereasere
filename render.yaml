@@ -1,33 +1,12 @@
-# render.yaml — Web Service en Render.com
-#
-# Cómo Render construye y arranca el servicio:
-#
-#   BUILD:  docker build -t app .
-#   START:  CMD del Dockerfile  →  python -u main.py
-#
-# Si quieres despliegue SIN Docker (Python nativo en Render):
-#   Comenta "runtime: docker" y descomenta buildCommand / startCommand.
-
 services:
   - type: web
     name: tg-dl-bot
-    runtime: docker
+    runtime: docker          # ← Fuerza Docker, ignora el entorno nativo de Render
     plan: free
-
-    # ── Con Docker (recomendado) ───────────────────────────────────────────
-    # Build y start los define el Dockerfile automáticamente.
-    # No hace falta declararlos cuando runtime: docker.
-
-    # ── Sin Docker (Python nativo) — descomenta si prefieres: ─────────────
-    # buildCommand: pip install -r requirements.txt
-    # startCommand: python -u main.py
-
-    # Render hace GET /health cada 30s.
-    # Si no responde 2xx → reinicia el contenedor.
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /health
 
     envVars:
-      # ── Requeridas — configúralas en el Dashboard, nunca aquí ────────────
       - key: API_ID
         sync: false
       - key: API_HASH
@@ -35,14 +14,9 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: SESSION_STRING
-        sync: false   # String de sesión de tu cuenta — ver README paso 1
-
-      # RENDER_EXTERNAL_URL la inyecta Render automáticamente.
-      # El bot la usa para registrar el webhook. NO la toques.
-
-      # ── Opcionales (ya tienen defaults en config.py) ──────────────────────
+        sync: false
       - key: CHUNK_SIZE
-        value: "524288"             # 512 KB por chunk de streaming
+        value: "524288"
       - key: MAX_BATCH_SIZE
         value: "50"
       - key: PROGRESS_UPDATE_INTERVAL

@@ -1,11 +1,3 @@
-# ── Framework de bot ──────────────────────────────────────────────────────────
 pyrogram==2.0.106
-
-# Aceleración criptográfica en C para Pyrogram.
-# OBLIGATORIO: sin esto el streaming de archivos grandes es ~10x más lento.
 TgCrypto==1.2.5
-
-# ── Servidor HTTP (Web Service / Webhook) ──────────────────────────────────────
-# aiohttp: servidor HTTP async nativo, compatible con el event loop de Pyrogram.
-# Alternativas (FastAPI+uvicorn) son más pesadas para este caso de uso.
 aiohttp==3.9.5

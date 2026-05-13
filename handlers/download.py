@@ -202,6 +202,15 @@ async def _stream_and_send(
         update_interval=PROGRESS_UPDATE_INTERVAL,
     )
 
+    # --- CLASE WRAPPER PARA EL GENERADOR ---
+    class AsyncStreamWrapper:
+        def __init__(self, generator, name):
+            self.generator = generator
+            self.name = name # Esto es lo que Pyrogram busca
+
+        def __aiter__(self):
+            return self.generator
+
     try:
         async def chunk_generator():
             async for chunk in user.stream_media(src):
@@ -209,12 +218,14 @@ async def _stream_and_send(
                     await tracker.update(len(chunk))
                     yield chunk
 
-        # El objeto generador necesita un atributo 'name' para que Pyrogram sepa el nombre del archivo
-        stream = chunk_generator()
-        setattr(stream, "name", file_name)
+        # Envolvemos el generador en nuestra clase
+        stream_wrapped = AsyncStreamWrapper(chunk_generator(), file_name)
 
         await _safe_edit(status_msg, f"{pfx}📤 Transfiriendo `{file_name}`...")
-        await _dispatch_media(bot, original_msg.chat.id, src, stream, caption)
+        
+        # Enviamos el objeto envuelto
+        await _dispatch_media(bot, original_msg.chat.id, src, stream_wrapped, caption)
+        
         await _safe_edit(status_msg, f"{pfx}✅ `{file_name}` entregado.")
 
     except Exception as e:

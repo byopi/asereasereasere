@@ -1,0 +1,11 @@
+*.session
+*.session-journal
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.idea/
+.DS_Store
+temp_session.session

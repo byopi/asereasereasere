@@ -260,10 +260,11 @@ async def _stream_and_send(
 async def _iter_chunks(user: Client, msg: Message) -> AsyncGenerator[bytes, None]:
     """
     Generador asíncrono sobre stream_media().
-    Cada `yield` trae CHUNK_SIZE bytes del servidor de Telegram.
-    En ningún momento se guarda más de un chunk a la vez en esta función.
+    Se eliminó 'chunk_size' porque Pyrogram lo gestiona internamente
+    o no lo reconoce como argumento de palabra clave en esta versión.
     """
-    async for chunk in user.stream_media(msg, chunk_size=CHUNK_SIZE):
+    # Eliminamos 'chunk_size=CHUNK_SIZE'
+    async for chunk in user.stream_media(msg):
         yield chunk
 
 

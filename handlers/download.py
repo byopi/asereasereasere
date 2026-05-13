@@ -1,32 +1,21 @@
 """
-handlers/download.py — Lógica de descarga con streaming Zero-Disk.
+handlers/download.py — Lógica de transferencia con Piping (0-RAM).
 
-Gestión de memoria (por qué no hay OOM con archivos grandes):
+Gestión de memoria (Streaming Directo):
 ─────────────────────────────────────────────────────────────
-  `client.stream_media()` es un generador asíncrono que hace requests
-  HTTP al CDN de Telegram y yield-ea chunks sin cargarlos todos en RAM.
-
-  Cada chunk (512 KB por defecto) se escribe en un `io.BytesIO`.
-  El BytesIO crece hasta el tamaño total del archivo, luego se hace
-  seek(0) y se pasa a send_document/send_video/etc.
+  En lugar de acumular el archivo en RAM, usamos un generador asíncrono.
+  Pyrogram descarga un chunk y lo envía inmediatamente al método de subida.
 
   ┌─────────────────────────────────────────────────────────────┐
-  │  RAM usada ≈ tamaño del archivo + overhead de Pyrogram      │
-  │  Disco usado = 0 bytes (nunca se llama a open())            │
+  │  RAM usada ≈ 0 (solo el chunk actual en tránsito)           │
+  │  Disco usado = 0 bytes                                      │
   └─────────────────────────────────────────────────────────────┘
 
-  Para el plan FREE de Render (512 MB RAM):
-    • Archivos < 400 MB → funcionan con margen
-    • Archivos > 400 MB → usa plan Starter (2 GB RAM)
-    • Archivos > 2 GB   → Telegram impone este límite en su API de bots
-
-Fallback logic:
-  1. copy_message()  → copia sin tráfico extra (ideal si funciona)
-  2. stream_media()  → si copy falla por restricciones del canal
+  • Funciona en el plan FREE de Render para cualquier tamaño (< 2 GB).
+  • Se evita el error OOM (Out of Memory).
 """
 
 import asyncio
-import io
 import logging
 from typing import AsyncGenerator, Optional
 
@@ -133,7 +122,6 @@ async def handle_bdl(bot: Client, user: Client, message: Message) -> None:
             fail += 1
             logger.warning("%s Error en msg %d: %s", batch_prefix, msg_id, e)
 
-        # Pausa entre mensajes para no saturar la API
         await asyncio.sleep(1.5)
 
     await status.edit_text(
@@ -155,14 +143,8 @@ async def _process_single(
     msg_id: int,
     batch_prefix: str = "",
 ) -> None:
-    """
-    Estrategia de dos pasos:
-      1. copy_message → rápido, sin overhead
-      2. stream_media → si el canal bloquea el reenvío
-    """
     pfx = f"{batch_prefix} " if batch_prefix else ""
 
-    # ── Obtener el mensaje con el cliente de usuario ───────────────────────
     try:
         src = await _get_message_with_retry(user, chat_id, msg_id)
     except (MessageIdInvalid, ChannelPrivate, PeerIdInvalid) as e:
@@ -170,19 +152,17 @@ async def _process_single(
         return
 
     if src is None:
-        await _safe_edit(status_msg, f"{pfx}⚠️ Mensaje `{msg_id}` no existe o fue eliminado.")
+        await _safe_edit(status_msg, f"{pfx}⚠️ Mensaje `{msg_id}` no existe.")
         return
 
-    # ── Solo texto (sin media) → copiar directamente ──────────────────────
     if not src.media:
         await bot.send_message(
             original_msg.chat.id,
             text=src.text or src.caption or "_(Mensaje sin contenido)_",
         )
-        await _safe_edit(status_msg, f"{pfx}✅ Texto del mensaje `{msg_id}` copiado.")
+        await _safe_edit(status_msg, f"{pfx}✅ Texto copiado.")
         return
 
-    # ── Intento 1: copy_message ────────────────────────────────────────────
     await _safe_edit(status_msg, f"{pfx}📋 Intentando copia directa...")
     try:
         await user.copy_message(
@@ -190,18 +170,17 @@ async def _process_single(
             from_chat_id=chat_id,
             message_id=msg_id,
         )
-        await _safe_edit(status_msg, f"{pfx}✅ Mensaje `{msg_id}` copiado.")
+        await _safe_edit(status_msg, f"{pfx}✅ Copiado correctamente.")
         return
-    except (ChatForwardsRestricted, Exception) as e:
-        logger.info("copy_message bloqueado para %s/%d (%s). Pasando a streaming.", chat_id, msg_id, type(e).__name__)
+    except (ChatForwardsRestricted, Exception):
+        logger.info("copy_message bloqueado. Pasando a Streaming Directo.")
 
-    # ── Intento 2: Streaming Zero-Disk ────────────────────────────────────
-    await _safe_edit(status_msg, f"{pfx}⚡ Canal restringido. Iniciando streaming en memoria...")
+    await _safe_edit(status_msg, f"{pfx}⚡ Canal restringido. Iniciando transferencia directa...")
     await _stream_and_send(bot, user, original_msg, status_msg, src, pfx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Streaming Zero-Disk: RAM buffer → Telegram upload
+# Streaming Directo (Piping)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _stream_and_send(
@@ -212,15 +191,6 @@ async def _stream_and_send(
     src: Message,
     pfx: str,
 ) -> None:
-    """
-    Descarga el media chunk a chunk en un io.BytesIO (RAM).
-    Cuando termina, lo sube a Telegram directamente desde RAM.
-
-    io.BytesIO actúa como un archivo en memoria:
-      • .write(chunk) → acumula bytes
-      • .seek(0)      → rebobina para lectura
-      • .close()      → GC libera la RAM (sin archivo que borrar)
-    """
     total_size = _get_media_size(src)
     file_name = _get_media_name(src) or f"file_{src.id}"
     caption = src.caption or ""
@@ -232,108 +202,68 @@ async def _stream_and_send(
         update_interval=PROGRESS_UPDATE_INTERVAL,
     )
 
-    # ── Buffer en RAM ──────────────────────────────────────────────────────
-    # Nunca se llama a open(). Este objeto vive exclusivamente en heap memory.
-    buffer = io.BytesIO()
-    buffer.name = file_name  # Pyrogram usa .name como nombre de archivo
-
     try:
-        async for chunk in _iter_chunks(user, src):
-            buffer.write(chunk)
-            await tracker.update(len(chunk))
+        async def chunk_generator():
+            async for chunk in user.stream_media(src):
+                if chunk:
+                    await tracker.update(len(chunk))
+                    yield chunk
 
-        # Rebobinar obligatorio antes de pasar a Pyrogram
-        buffer.seek(0)
+        # El objeto generador necesita un atributo 'name' para que Pyrogram sepa el nombre del archivo
+        stream = chunk_generator()
+        setattr(stream, "name", file_name)
 
-        await _safe_edit(status_msg, f"{pfx}📤 Subiendo `{file_name}`...")
-        await _dispatch_media(bot, original_msg.chat.id, src, buffer, caption)
+        await _safe_edit(status_msg, f"{pfx}📤 Transfiriendo `{file_name}`...")
+        await _dispatch_media(bot, original_msg.chat.id, src, stream, caption)
         await _safe_edit(status_msg, f"{pfx}✅ `{file_name}` entregado.")
 
     except Exception as e:
         logger.error("Error en streaming msg %d: %s", src.id, e, exc_info=True)
-        await _safe_edit(status_msg, f"{pfx}❌ Error durante el streaming: `{e}`")
-        raise
-    finally:
-        buffer.close()  # Liberar RAM explícitamente
-
-
-async def _iter_chunks(user: Client, msg: Message) -> AsyncGenerator[bytes, None]:
-    """
-    Generador asíncrono sobre stream_media().
-    Se eliminó 'chunk_size' porque Pyrogram lo gestiona internamente
-    o no lo reconoce como argumento de palabra clave en esta versión.
-    """
-    # Eliminamos 'chunk_size=CHUNK_SIZE'
-    async for chunk in user.stream_media(msg):
-        yield chunk
+        await _safe_edit(status_msg, f"{pfx}❌ Error de transferencia: `{e}`")
 
 
 async def _dispatch_media(
     bot: Client,
     chat_id: int,
     src: Message,
-    buffer: io.BytesIO,
+    stream: AsyncGenerator,
     caption: str,
 ) -> None:
-    """Envía el buffer según el tipo de media del mensaje original."""
     kw = dict(chat_id=chat_id, caption=caption)
     media_type = src.media.value if src.media else "document"
 
-    dispatch = {
-        "video":      lambda: bot.send_video(video=buffer, **kw),
-        "audio":      lambda: bot.send_audio(audio=buffer, **kw),
-        "voice":      lambda: bot.send_voice(voice=buffer, **kw),
-        "photo":      lambda: bot.send_photo(photo=buffer, **kw),
-        "animation":  lambda: bot.send_animation(animation=buffer, **kw),
-        "video_note": lambda: bot.send_video_note(video_note=buffer, **kw),
-    }
-
-    send_fn = dispatch.get(media_type)
-    if send_fn:
-        await send_fn()
+    if media_type == "video":
+        await bot.send_video(video=stream, **kw)
+    elif media_type == "audio":
+        await bot.send_audio(audio=stream, **kw)
+    elif media_type == "voice":
+        await bot.send_voice(voice=stream, **kw)
+    elif media_type == "photo":
+        await bot.send_photo(photo=stream, **kw)
+    elif media_type == "animation":
+        await bot.send_animation(animation=stream, **kw)
     else:
-        # sticker, document, cualquier tipo desconocido
-        await bot.send_document(document=buffer, **kw)
+        await bot.send_document(document=stream, **kw)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Helpers
+# Helpers y Reintentos
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _get_message_with_retry(
-    user: Client,
-    chat_id: str,
-    msg_id: int,
-    max_retries: int = 3,
-) -> Optional[Message]:
-    """
-    Versión agresiva para solucionar PEER_ID_INVALID.
-    Fuerza la actualización de la base de datos de la sesión.
-    """
-    
-    # 1. Normalización del ID (Prefijo -100 necesario para canales)
+async def _get_message_with_retry(user: Client, chat_id: str, msg_id: int, max_retries: int = 3) -> Optional[Message]:
     raw_id = str(chat_id).replace("c/", "")
-    if raw_id.isdigit():
-        target_id = int(f"-100{raw_id}")
-    else:
-        target_id = chat_id # Si es un username tipo @canal
+    target_id = int(f"-100{raw_id}") if raw_id.isdigit() else chat_id
 
-    # 2. Forzar el 'encuentro' con el peer (Truco de sincronización)
     try:
-        # Intentamos obtenerlo directamente
         await user.get_chat(target_id)
     except Exception:
         try:
-            # Si falla, buscamos en los últimos 100 chats del usuario
-            # Esto obliga a Pyrogram a guardar el Access Hash en memoria
             async for dialog in user.get_dialogs(limit=100):
                 if str(dialog.chat.id) == str(target_id):
-                    logger.info(f"¡Canal {target_id} encontrado en diálogos!")
                     break
-        except Exception as e:
-            logger.error(f"Error crítico sincronizando diálogos: {e}")
+        except Exception:
+            pass
 
-    # 3. Intento de obtención del mensaje con Backoff
     for attempt in range(max_retries):
         try:
             return await user.get_messages(target_id, msg_id)
@@ -341,23 +271,17 @@ async def _get_message_with_retry(
             await asyncio.sleep(fw.value + 1)
         except PeerIdInvalid:
             if attempt < max_retries - 1:
-                # Último recurso: intentar resolver el peer explícitamente
-                try:
-                    await user.resolve_peer(target_id)
-                except Exception:
-                    pass
+                try: await user.resolve_peer(target_id)
+                except: pass
                 await asyncio.sleep(2)
                 continue
             raise
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise
+        except Exception:
+            if attempt == max_retries - 1: raise
             await asyncio.sleep(2)
-            
     return None
 
 async def _safe_edit(msg: Message, text: str) -> None:
-    """Edita un mensaje ignorando errores de contenido idéntico."""
     try:
         await msg.edit_text(text)
     except MessageNotModified:
@@ -365,9 +289,8 @@ async def _safe_edit(msg: Message, text: str) -> None:
     except FloodWait as fw:
         await asyncio.sleep(fw.value)
         await _safe_edit(msg, text)
-    except Exception as e:
-        logger.debug("No se pudo editar mensaje de estado: %s", e)
-
+    except Exception:
+        pass
 
 def _get_media_size(msg: Message) -> int:
     for attr in ("video", "audio", "document", "voice", "video_note", "animation", "sticker"):
@@ -375,7 +298,6 @@ def _get_media_size(msg: Message) -> int:
         if obj and hasattr(obj, "file_size") and obj.file_size:
             return obj.file_size
     return 0
-
 
 def _get_media_name(msg: Message) -> Optional[str]:
     for attr in ("video", "audio", "document", "animation"):

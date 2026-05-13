@@ -305,9 +305,19 @@ async def _get_message_with_retry(
     msg_id: int,
     max_retries: int = 3,
 ) -> Optional[Message]:
-    """Obtiene un mensaje con reintentos y backoff exponencial para FloodWait."""
+    """Obtiene un mensaje con reintentos y corrección de ID para canales."""
     
-    # --- FIX PARA PEER_ID_INVALID: Forzar al cliente a reconocer el chat ---
+    # ── CORRECCIÓN DE ID ──
+    # Si el chat_id es numérico y no empieza con -100, se lo ponemos.
+    # Esto soluciona el PEER_ID_INVALID en enlaces tipo /c/
+    str_chat_id = str(chat_id)
+    if str_chat_id.isdigit() and not str_chat_id.startswith("-100"):
+        chat_id = int(f"-100{str_chat_id}")
+    elif str_chat_id.startswith("c/"): # Por si el parser trae la 'c/'
+        clean_id = str_chat_id.replace("c/", "")
+        chat_id = int(f"-100{clean_id}")
+
+    # Forzar al cliente a reconocer el chat
     try:
         await user.get_chat(chat_id)
     except Exception as e:
@@ -318,15 +328,13 @@ async def _get_message_with_retry(
             return await user.get_messages(chat_id, msg_id)
         except FloodWait as fw:
             wait = fw.value + 2
-            logger.warning("FloodWait: esperando %ds (intento %d/%d)", wait, attempt + 1, max_retries)
             await asyncio.sleep(wait)
         except (MessageIdInvalid, ChannelPrivate):
-            raise  # No reintentar errores de acceso
+            raise
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
             wait = 2 ** attempt
-            logger.warning("Reintento %d/%d en %ds por: %s", attempt + 1, max_retries, wait, e)
             await asyncio.sleep(wait)
     return None
 

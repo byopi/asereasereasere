@@ -1,6 +1,6 @@
 """
 handlers/download.py — Lógica de transferencia estable vía Pipes (0-RAM).
-Soluciona el error 'Invalid file' y permite archivos de hasta 2GB en Render Free.
+Versión Ultra-Compatible para Canales Privados y Públicos.
 """
 
 import asyncio
@@ -35,7 +35,7 @@ async def handle_dl(bot: Client, user: Client, message: Message) -> None:
         await message.reply_text("❌ URL inválida.")
         return
     chat_id, msg_id = parsed
-    status = await message.reply_text("🔍 Obteniendo mensaje...")
+    status = await message.reply_text("🔍 Localizando mensaje...")
     await _process_single(bot, user, message, status, chat_id, msg_id)
 
 async def handle_bdl(bot: Client, user: Client, message: Message) -> None:
@@ -65,23 +65,22 @@ async def handle_bdl(bot: Client, user: Client, message: Message) -> None:
 
 async def _process_single(bot: Client, user: Client, original_msg: Message, status_msg: Message, chat_id: str, msg_id: int, pfx: str = "") -> None:
     pfx = f"{pfx} " if pfx else ""
-    try:
-        src = await _get_message_with_retry(user, chat_id, msg_id)
-    except Exception as e:
-        await _safe_edit(status_msg, f"{pfx}❌ Error: {e}")
-        return
+    src = await _get_message_with_retry(user, chat_id, msg_id)
+    
     if not src:
-        await _safe_edit(status_msg, f"{pfx}⚠️ No existe.")
+        await _safe_edit(status_msg, f"{pfx}⚠️ El mensaje `{msg_id}` no es accesible o no existe.")
         return
+    
     if not src.media:
         await bot.send_message(original_msg.chat.id, src.text or src.caption or "...")
         await _safe_edit(status_msg, f"{pfx}✅ Texto copiado.")
         return
+
     try:
         await user.copy_message(original_msg.chat.id, chat_id, msg_id)
-        await _safe_edit(status_msg, f"{pfx}✅ Copia directa.")
+        await _safe_edit(status_msg, f"{pfx}✅ Copia directa exitosa.")
     except Exception:
-        await _safe_edit(status_msg, f"{pfx}⚡ Canal restringido. Usando Pipe...")
+        await _safe_edit(status_msg, f"{pfx}⚡ Restringido. Transfiriendo vía Pipe...")
         await _stream_and_send(bot, user, original_msg, status_msg, src, pfx)
 
 async def _stream_and_send(bot: Client, user: Client, original_msg: Message, status_msg: Message, src: Message, pfx: str) -> None:
@@ -127,12 +126,33 @@ async def _dispatch_media(bot: Client, chat_id: int, src: Message, fp, caption: 
     else: await bot.send_document(document=fp, **kw)
 
 async def _get_message_with_retry(user: Client, chat_id: str, msg_id: int) -> Optional[Message]:
-    raw_id = str(chat_id).replace("c/", "")
-    target_id = int(f"-100{raw_id}") if raw_id.isdigit() else chat_id
-    for _ in range(3):
-        try: return await user.get_messages(target_id, msg_id)
-        except FloodWait as e: await asyncio.sleep(e.value + 1)
-        except Exception: await asyncio.sleep(2)
+    # Normalización del ID
+    raw_id = str(chat_id).replace("c/", "").replace("-100", "")
+    if raw_id.isdigit():
+        target_id = int(f"-100{raw_id}")
+    else:
+        target_id = chat_id 
+
+    for attempt in range(3):
+        try:
+            # Intento 1: Obtener mensaje directamente
+            msg = await user.get_messages(target_id, msg_id)
+            if msg and not msg.empty:
+                return msg
+        except (PeerIdInvalid, Exception):
+            # Intento 2: Forzar reconocimiento del canal
+            try:
+                await user.get_chat(target_id)
+            except Exception:
+                try:
+                    # Intento 3: Buscar en diálogos recientes para obtener Access Hash
+                    async for dialog in user.get_dialogs(limit=20):
+                        if str(dialog.chat.id) == str(target_id):
+                            break
+                except Exception:
+                    pass
+        
+        await asyncio.sleep(2)
     return None
 
 async def _safe_edit(msg: Message, text: str) -> None:

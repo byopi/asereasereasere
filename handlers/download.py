@@ -305,39 +305,55 @@ async def _get_message_with_retry(
     msg_id: int,
     max_retries: int = 3,
 ) -> Optional[Message]:
-    """Obtiene un mensaje con reintentos y corrección de ID para canales."""
+    """
+    Versión agresiva para solucionar PEER_ID_INVALID.
+    Fuerza la actualización de la base de datos de la sesión.
+    """
     
-    # ── CORRECCIÓN DE ID ──
-    # Si el chat_id es numérico y no empieza con -100, se lo ponemos.
-    # Esto soluciona el PEER_ID_INVALID en enlaces tipo /c/
-    str_chat_id = str(chat_id)
-    if str_chat_id.isdigit() and not str_chat_id.startswith("-100"):
-        chat_id = int(f"-100{str_chat_id}")
-    elif str_chat_id.startswith("c/"): # Por si el parser trae la 'c/'
-        clean_id = str_chat_id.replace("c/", "")
-        chat_id = int(f"-100{clean_id}")
+    # 1. Normalización del ID (Prefijo -100 necesario para canales)
+    raw_id = str(chat_id).replace("c/", "")
+    if raw_id.isdigit():
+        target_id = int(f"-100{raw_id}")
+    else:
+        target_id = chat_id # Si es un username tipo @canal
 
-    # Forzar al cliente a reconocer el chat
+    # 2. Forzar el 'encuentro' con el peer (Truco de sincronización)
     try:
-        await user.get_chat(chat_id)
-    except Exception as e:
-        logger.debug("No se pudo pre-obtener chat %s: %s", chat_id, e)
+        # Intentamos obtenerlo directamente
+        await user.get_chat(target_id)
+    except Exception:
+        try:
+            # Si falla, buscamos en los últimos 100 chats del usuario
+            # Esto obliga a Pyrogram a guardar el Access Hash en memoria
+            async for dialog in user.get_dialogs(limit=100):
+                if str(dialog.chat.id) == str(target_id):
+                    logger.info(f"¡Canal {target_id} encontrado en diálogos!")
+                    break
+        except Exception as e:
+            logger.error(f"Error crítico sincronizando diálogos: {e}")
 
+    # 3. Intento de obtención del mensaje con Backoff
     for attempt in range(max_retries):
         try:
-            return await user.get_messages(chat_id, msg_id)
+            return await user.get_messages(target_id, msg_id)
         except FloodWait as fw:
-            wait = fw.value + 2
-            await asyncio.sleep(wait)
-        except (MessageIdInvalid, ChannelPrivate):
+            await asyncio.sleep(fw.value + 1)
+        except PeerIdInvalid:
+            if attempt < max_retries - 1:
+                # Último recurso: intentar resolver el peer explícitamente
+                try:
+                    await user.resolve_peer(target_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+                continue
             raise
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
-            wait = 2 ** attempt
-            await asyncio.sleep(wait)
+            await asyncio.sleep(2)
+            
     return None
-
 
 async def _safe_edit(msg: Message, text: str) -> None:
     """Edita un mensaje ignorando errores de contenido idéntico."""

@@ -90,20 +90,22 @@ async def _stream_and_send(bot: Client, user: Client, original_msg: Message, sta
     writer = os.fdopen(w, "wb")
 
     class FileProxy(io.RawIOBase):
-        def __init__(self, file_obj, custom_name):
+        def __init__(self, file_obj, custom_name, size):
             self._file = file_obj
             self.name = custom_name
+            self.file_size = size # Forzamos el atributo que busca Pyrogram
 
         def read(self, n=-1): return self._file.read(n)
         def readable(self): return True
-        def seekable(self): return False # Fix error 'seek'
+        def seekable(self): return False
         def seek(self, offset, whence=0): return 0
         def tell(self): return 0
         def close(self):
             super().close()
             return self._file.close()
 
-    readable_proxy = FileProxy(reader, file_name)
+    # Pasamos el tamaño total al proxy
+    readable_proxy = FileProxy(reader, file_name, total_size)
 
     async def download():
         try:
@@ -112,21 +114,30 @@ async def _stream_and_send(bot: Client, user: Client, original_msg: Message, sta
                     writer.write(chunk)
                     await tracker.update(len(chunk))
             writer.flush()
+        except Exception as e:
+            logger.error(f"Error en download: {e}")
         finally:
-            writer.close()
+            # Importante: No cerrar el pipe hasta que estemos seguros
+            try: writer.close()
+            except: pass
 
     async def upload():
         try:
+            # Pequeña espera para asegurar que el pipe tenga datos iniciales
+            await asyncio.sleep(1) 
             await _dispatch_media(bot, original_msg.chat.id, src, readable_proxy, src.caption or "")
+        except Exception as e:
+            logger.error(f"Error en upload: {e}")
+            raise e # Re-lanzar para que gather lo capture
         finally:
-            readable_proxy.close()
+            try: readable_proxy.close()
+            except: pass
 
     try:
-        # Aseguramos que ambas tareas terminen correctamente
         await asyncio.gather(download(), upload())
         await _safe_edit(status_msg, f"{pfx}✅ `{file_name}` enviado.")
     except Exception as e:
-        logger.error(f"Error en transferencia: {e}")
+        logger.error(f"Error general: {e}")
         await _safe_edit(status_msg, f"{pfx}❌ Error: `{e}`")
 
 async def _dispatch_media(bot: Client, chat_id: int, src: Message, fp, caption: str) -> None:

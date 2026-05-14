@@ -51,11 +51,8 @@ async def health_handler(request: web.Request) -> web.Response:
 
 async def debug_chats_handler(request: web.Request) -> web.Response:
     """
-    DEBUG ENDPOINT: Lista todos los chats/canales a los que tiene acceso
-    la sesión del user_client.
-    
-    Acceso: GET /debug/chats
-    Muestra el chat_id que Pyrogram espera para cada canal.
+    DEBUG: Lista todos los chats/canales accesibles.
+    GET /debug/chats
     """
     user: Client = request.app["user"]
 
@@ -65,7 +62,7 @@ async def debug_chats_handler(request: web.Request) -> web.Response:
             chat = dialog.chat
             chat_info = {
                 "name": chat.title or chat.username or "Sin nombre",
-                "type": chat.type,
+                "type": str(chat.type),  # Convertir ChatType a string
                 "id": chat.id,
                 "username": getattr(chat, "username", None),
             }
@@ -78,7 +75,7 @@ async def debug_chats_handler(request: web.Request) -> web.Response:
         })
 
     except Exception as e:
-        logger.error("Error listando chats: %s", e)
+        logger.error("Error listando chats: %s", e, exc_info=True)
         return web.json_response({
             "status": "error",
             "error": str(e),

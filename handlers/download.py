@@ -80,12 +80,20 @@ async def _process_single(bot: Client, user: Client, original_msg: Message, stat
         await _safe_edit(status_msg, f"{pfx}⚡ Restringido. Transfiriendo vía Pipe...")
         await _stream_and_send(bot, user, original_msg, status_msg, src, pfx)
 
-class FileProxy(io.RawIOBase):
+async def _stream_and_send(bot: Client, user: Client, original_msg: Message, status_msg: Message, src: Message, pfx: str) -> None:
+    total_size = _get_media_size(src)
+    file_name = _get_media_name(src) or f"file_{src.id}"
+    tracker = ProgressTracker(total_size, status_msg, pfx, PROGRESS_UPDATE_INTERVAL)
+    
+    r, w = os.pipe()
+    reader = os.fdopen(r, "rb")
+    writer = os.fdopen(w, "wb")
+
+    class FileProxy(io.RawIOBase):
         def __init__(self, file_obj, custom_name, size):
             self._file = file_obj
             self.name = custom_name
             self._size = size
-            # Inyectamos todas las posibles variantes que busca Pyrogram
             self.file_size = size 
             self.size = size
 
@@ -104,6 +112,7 @@ class FileProxy(io.RawIOBase):
             super().close()
             return self._file.close()
 
+    # Esta línea (107) debe estar al mismo nivel que 'r, w = os.pipe()'
     readable_proxy = FileProxy(reader, file_name, total_size)
 
     async def download():
@@ -116,36 +125,32 @@ class FileProxy(io.RawIOBase):
         except Exception as e:
             logger.error(f"Error en download: {e}")
         finally:
-            # Cerramos el escritor para que el lector reciba el EOF correctamente
-            try: writer.close()
-            except: pass
+            try:
+                writer.close()
+            except:
+                pass
 
     async def upload():
         try:
-            # Aumentamos el margen de seguridad a 3 segundos para Render
             await asyncio.sleep(3) 
-            
-            # Verificación manual antes de disparar
             if total_size <= 0:
-                logger.error("El tamaño detectado del medio es 0.")
-                raise Exception("No se pudo determinar el tamaño del archivo.")
-
+                raise Exception("El tamaño del archivo es 0 o no se detectó.")
             await _dispatch_media(bot, original_msg.chat.id, src, readable_proxy, src.caption or "")
         except Exception as e:
             logger.error(f"Error en upload: {e}")
             raise e
         finally:
-            try: readable_proxy.close()
-            except: pass
+            try:
+                readable_proxy.close()
+            except:
+                pass
 
     try:
-        # Usamos wait_for o gather para asegurar que el error de upload rompa el ciclo
         await asyncio.gather(download(), upload())
         await _safe_edit(status_msg, f"{pfx}✅ `{file_name}` enviado.")
     except Exception as e:
-        # Si hubo un Broken Pipe o 0 Bytes, lo reportamos aquí
-        logger.error(f"Error general en transferencia: {e}")
-        await _safe_edit(status_msg, f"{pfx}❌ Falló la transferencia: `{str(e)}`")
+        logger.error(f"Error general: {e}")
+        await _safe_edit(status_msg, f"{pfx}❌ Error: `{e}`")
 
 async def _dispatch_media(bot: Client, chat_id: int, src: Message, fp, caption: str) -> None:
     kw = dict(chat_id=chat_id, caption=caption)

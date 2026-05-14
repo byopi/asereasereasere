@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 
 from aiohttp import web
 from pyrogram import Client
-from pyrogram.types import Update
 
 import config
 
@@ -18,20 +17,16 @@ def setup_routes(app: web.Application) -> None:
     app.router.add_post(f"/webhook/{config.BOT_TOKEN}", webhook_handler)
     app.router.add_get("/health", health_handler)
     app.router.add_get("/", dashboard_handler)
+    app.router.add_get("/debug/chats", debug_chats_handler)
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
-    """
-    Recibe el JSON de Telegram y lo procesa con Pyrogram.
-    Responde 200 OK inmediatamente; el procesamiento ocurre en background.
-    """
     bot: Client = request.app["bot"]
 
     try:
         data = await request.json()
         _stats["updates_received"] += 1
 
-        # Pyrogram procesa el dict del update directamente
         asyncio.ensure_future(
             bot.handle_updates(data)
         )
@@ -41,7 +36,6 @@ async def webhook_handler(request: web.Request) -> web.Response:
     except Exception as e:
         _stats["errors"] += 1
         logger.error("Error procesando update: %s", e)
-        # Siempre 200 a Telegram — si devuelves 5xx deja de enviar updates
         return web.Response(status=200, text="OK")
 
 
@@ -53,6 +47,42 @@ async def health_handler(request: web.Request) -> web.Response:
         "updates_received": _stats["updates_received"],
         "errors": _stats["errors"],
     })
+
+
+async def debug_chats_handler(request: web.Request) -> web.Response:
+    """
+    DEBUG ENDPOINT: Lista todos los chats/canales a los que tiene acceso
+    la sesión del user_client.
+    
+    Acceso: GET /debug/chats
+    Muestra el chat_id que Pyrogram espera para cada canal.
+    """
+    user: Client = request.app["user"]
+
+    try:
+        chats = []
+        async for dialog in user.get_dialogs():
+            chat = dialog.chat
+            chat_info = {
+                "name": chat.title or chat.username or "Sin nombre",
+                "type": chat.type,
+                "id": chat.id,
+                "username": getattr(chat, "username", None),
+            }
+            chats.append(chat_info)
+
+        return web.json_response({
+            "status": "ok",
+            "total_chats": len(chats),
+            "chats": chats,
+        })
+
+    except Exception as e:
+        logger.error("Error listando chats: %s", e)
+        return web.json_response({
+            "status": "error",
+            "error": str(e),
+        }, status=500)
 
 
 async def dashboard_handler(request: web.Request) -> web.Response:
@@ -82,6 +112,8 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     .cmds{{margin-top:1.5rem;padding:1rem;background:#0d1117;border-radius:6px;
            font-size:.85rem;color:#8b949e;line-height:1.8}}
     code{{color:#79c0ff}}
+    .debug{{margin-top:1rem;padding-top:1rem;border-top:1px solid #21262d;font-size:.8rem}}
+    a{{color:#58a6ff;text-decoration:none}}
   </style>
 </head>
 <body>
@@ -95,6 +127,9 @@ async def dashboard_handler(request: web.Request) -> web.Response:
     <div class="cmds">
       <code>/dl &lt;url&gt;</code> — Descarga un mensaje<br>
       <code>/bdl &lt;url1&gt; &lt;url2&gt;</code> — Descarga por lotes
+    </div>
+    <div class="debug">
+      🔧 <a href="/debug/chats">Ver chats accesibles</a>
     </div>
   </div>
 </body>

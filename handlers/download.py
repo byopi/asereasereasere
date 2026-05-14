@@ -1,6 +1,6 @@
 """
 handlers/download.py — Lógica de transferencia estable vía Pipes (0-RAM).
-Versión Final: Corregido error de validación de puntero binario.
+Versión Final Corregida: Soporte para flujos no buscables (no-seek) y validación real.
 """
 
 import asyncio
@@ -12,15 +12,11 @@ from typing import Optional
 from pyrogram import Client
 from pyrogram.errors import (
     FloodWait,
-    MessageIdInvalid,
-    ChannelPrivate,
-    ChatForwardsRestricted,
-    MessageNotModified,
     PeerIdInvalid,
 )
 from pyrogram.types import Message
 
-from config import CHUNK_SIZE, MAX_BATCH_SIZE, PROGRESS_UPDATE_INTERVAL
+from config import MAX_BATCH_SIZE, PROGRESS_UPDATE_INTERVAL
 from utils.parser import parse_telegram_url
 from utils.progress import ProgressTracker
 
@@ -93,18 +89,16 @@ async def _stream_and_send(bot: Client, user: Client, original_msg: Message, sta
     reader = os.fdopen(r, "rb")
     writer = os.fdopen(w, "wb")
 
-    # Proxy definitivo: hereda de RawIOBase para pasar las validaciones de Pyrogram
     class FileProxy(io.RawIOBase):
         def __init__(self, file_obj, custom_name):
             self._file = file_obj
             self.name = custom_name
 
-        def read(self, n=-1):
-            return self._file.read(n)
-
-        def readable(self):
-            return True
-
+        def read(self, n=-1): return self._file.read(n)
+        def readable(self): return True
+        def seekable(self): return False # Fix error 'seek'
+        def seek(self, offset, whence=0): return 0
+        def tell(self): return 0
         def close(self):
             super().close()
             return self._file.close()
@@ -118,20 +112,17 @@ async def _stream_and_send(bot: Client, user: Client, original_msg: Message, sta
                     writer.write(chunk)
                     await tracker.update(len(chunk))
             writer.flush()
-        except Exception as e:
-            logger.error(f"Error descargando: {e}")
         finally:
             writer.close()
 
     async def upload():
         try:
             await _dispatch_media(bot, original_msg.chat.id, src, readable_proxy, src.caption or "")
-        except Exception as e:
-            logger.error(f"Error subiendo: {e}")
         finally:
             readable_proxy.close()
 
     try:
+        # Aseguramos que ambas tareas terminen correctamente
         await asyncio.gather(download(), upload())
         await _safe_edit(status_msg, f"{pfx}✅ `{file_name}` enviado.")
     except Exception as e:

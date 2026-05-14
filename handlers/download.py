@@ -80,23 +80,16 @@ async def _process_single(bot: Client, user: Client, original_msg: Message, stat
         await _safe_edit(status_msg, f"{pfx}⚡ Restringido. Transfiriendo vía Pipe...")
         await _stream_and_send(bot, user, original_msg, status_msg, src, pfx)
 
-async def _stream_and_send(bot: Client, user: Client, original_msg: Message, status_msg: Message, src: Message, pfx: str) -> None:
-    total_size = _get_media_size(src)
-    file_name = _get_media_name(src) or f"file_{src.id}"
-    tracker = ProgressTracker(total_size, status_msg, pfx, PROGRESS_UPDATE_INTERVAL)
-    
-    r, w = os.pipe()
-    reader = os.fdopen(r, "rb")
-    writer = os.fdopen(w, "wb")
-
-    class FileProxy(io.RawIOBase):
+class FileProxy(io.RawIOBase):
         def __init__(self, file_obj, custom_name, size):
             self._file = file_obj
             self.name = custom_name
             self._size = size
+            # Inyectamos todas las posibles variantes que busca Pyrogram
+            self.file_size = size 
+            self.size = size
 
         def read(self, n=-1):
-            # Forzamos una lectura síncrona real sobre el descriptor
             return self._file.read(n)
 
         def readable(self): return True
@@ -104,7 +97,6 @@ async def _stream_and_send(bot: Client, user: Client, original_msg: Message, sta
         def seek(self, offset, whence=0): return 0
         def tell(self): return 0
         
-        # CRÍTICO: Pyrogram usa len() o __len__ para validar el tamaño inicial
         def __len__(self):
             return self._size
 
@@ -130,9 +122,14 @@ async def _stream_and_send(bot: Client, user: Client, original_msg: Message, sta
 
     async def upload():
         try:
-            # Espera estratégica para que el pipe se llene un poco
-            # Esto evita el error de "0 bytes" en conexiones rápidas o Render
-            await asyncio.sleep(2) 
+            # Aumentamos el margen de seguridad a 3 segundos para Render
+            await asyncio.sleep(3) 
+            
+            # Verificación manual antes de disparar
+            if total_size <= 0:
+                logger.error("El tamaño detectado del medio es 0.")
+                raise Exception("No se pudo determinar el tamaño del archivo.")
+
             await _dispatch_media(bot, original_msg.chat.id, src, readable_proxy, src.caption or "")
         except Exception as e:
             logger.error(f"Error en upload: {e}")

@@ -1,13 +1,12 @@
 """
-utils/parser.py — Parser de URLs de Telegram con soporte para canales privados.
+utils/parser.py — Parser de URLs de Telegram.
 
 Formatos soportados:
   https://t.me/canal/123          → canal público (@canal)
   https://t.me/c/1234567890/123   → canal privado
   t.me/canal/123                  → sin esquema
 
-El truco: para canales privados, el ID debe ser negativo pero SIN el -100.
-Pyrogram lo maneja internamente.
+Para canales privados: t.me/c/3779052214/27 → ID: -1003779052214
 """
 
 import re
@@ -31,10 +30,9 @@ def parse_telegram_url(url: str) -> Optional[Tuple[str, int]]:
     Devuelve (chat_id, message_id) o None si la URL es inválida.
 
     Para canales privados:
-      - La URL tiene: t.me/c/3779052214/27
-      - Extraemos: 3779052214 (el número del canal)
-      - Lo convertimos a: -3779052214 (negativo, sin el -100)
-      - Pyrogram lo reconoce correctamente
+      - URL: t.me/c/3779052214/27
+      - ID que Pyrogram espera: -1003779052214
+      - Lógica: -100 + número del canal
     """
     url = url.strip()
 
@@ -43,8 +41,8 @@ def parse_telegram_url(url: str) -> Optional[Tuple[str, int]]:
     if m:
         raw_id = m.group(1)
         msg_id = int(m.group(2))
-        # Convertir a formato que Pyrogram entiende: negativo sin -100
-        chat_id = f"-{raw_id}"
+        # Formato correcto: -100 + ID del canal
+        chat_id = f"-100{raw_id}"
         return chat_id, msg_id
 
     # ── Canal público ─────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ import io
 from typing import Optional
 
 from pyrogram import Client
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, PeerIdInvalid, ChannelPrivate, MessageIdInvalid
 from pyrogram.types import Message
 
 from config import MAX_BATCH_SIZE, PROGRESS_UPDATE_INTERVAL
@@ -110,7 +110,7 @@ async def _process_single(
     # Obtener el mensaje
     src = await _get_message_with_retry(user, chat_id, msg_id)
     if not src:
-        await _safe_edit(status_msg, f"{pfx}⚠️ Mensaje `{msg_id}` no accesible.")
+        await _safe_edit(status_msg, f"{pfx}⚠️ Mensaje `{msg_id}` no accesible o no existe.")
         return
 
     # Sin media: solo texto
@@ -310,18 +310,35 @@ async def _get_message_with_retry(
     msg_id: int,
     max_retries: int = 3,
 ) -> Optional[Message]:
-    """Obtiene un mensaje con reintentos."""
+    """Obtiene un mensaje con reintentos y logging detallado."""
+    logger.info("Intentando obtener mensaje %d del chat %s", msg_id, chat_id)
+
     for attempt in range(max_retries):
         try:
             msg = await user.get_messages(chat_id, msg_id)
             if msg and not msg.empty:
+                logger.info("✅ Mensaje %d obtenido", msg_id)
                 return msg
+            else:
+                logger.warning("Mensaje vacío o no existe: %d", msg_id)
+                return None
+
+        except (MessageIdInvalid, ChannelPrivate) as e:
+            logger.error("Error de acceso (%s): %s", type(e).__name__, e)
+            return None
+
         except FloodWait as fw:
+            logger.warning("FloodWait: esperando %d segundos", fw.value)
             await asyncio.sleep(fw.value + 1)
+
         except Exception as e:
-            logger.debug("Intento %d falló: %s", attempt + 1, e)
+            logger.warning("Intento %d/%d falló (%s): %s", 
+                          attempt + 1, max_retries, type(e).__name__, e)
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)
+            else:
+                logger.error("Agotados los reintentos para mensaje %d", msg_id)
+                return None
 
     return None
 

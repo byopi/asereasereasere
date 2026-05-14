@@ -1,10 +1,6 @@
 """
 handlers/download.py — Transferencia 0-RAM con os.pipe()
-
-Arquitectura:
-  stream_media() → pipe write → pipe read → send_video/send_document
-  
-Sin escribir en disco, sin cargar todo en RAM. Los pipes son buffers de kernel.
+Con soporte para canales privados y validación de peer.
 """
 
 import asyncio
@@ -24,10 +20,6 @@ from utils.progress import ProgressTracker
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# /dl — Descarga un solo mensaje
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def handle_dl(bot: Client, user: Client, message: Message) -> None:
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -43,10 +35,6 @@ async def handle_dl(bot: Client, user: Client, message: Message) -> None:
     status = await message.reply_text("🔍 Localizando mensaje...")
     await _process_single(bot, user, message, status, chat_id, msg_id)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /bdl — Descarga por lotes
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_bdl(bot: Client, user: Client, message: Message) -> None:
     args = message.text.split()
@@ -91,10 +79,6 @@ async def handle_bdl(bot: Client, user: Client, message: Message) -> None:
     await _safe_edit(status, f"✅ Lote completado: {ok} éxitos, {fail} fallos de {total}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Núcleo: procesar un mensaje
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def _process_single(
     bot: Client,
     user: Client,
@@ -104,23 +88,19 @@ async def _process_single(
     msg_id: int,
     pfx: str = "",
 ) -> None:
-    """Obtiene el mensaje y lo envía (copy o streaming)."""
     pfx = f"{pfx} " if pfx else ""
 
-    # Obtener el mensaje
     src = await _get_message_with_retry(user, chat_id, msg_id)
     if not src:
-        await _safe_edit(status_msg, f"{pfx}⚠️ Mensaje `{msg_id}` no accesible o no existe.")
+        await _safe_edit(status_msg, f"{pfx}⚠️ No puedo acceder a mensaje `{msg_id}`.\n_¿La sesión es válida? ¿Estás en el canal?_")
         return
 
-    # Sin media: solo texto
     if not src.media:
         text = src.text or src.caption or "_(Sin contenido)_"
         await bot.send_message(original_msg.chat.id, text)
         await _safe_edit(status_msg, f"{pfx}✅ Texto copiado.")
         return
 
-    # Con media: intentar copy primero
     try:
         await user.copy_message(original_msg.chat.id, chat_id, msg_id)
         await _safe_edit(status_msg, f"{pfx}✅ Mensaje copiado directamente.")
@@ -128,27 +108,11 @@ async def _process_single(
     except Exception as e:
         logger.info("Copy bloqueado (%s). Usando pipes...", type(e).__name__)
 
-    # Si copy falla: streaming con pipes
     await _safe_edit(status_msg, f"{pfx}⚡ Transfiriendo vía pipe...")
     await _stream_and_send(bot, user, original_msg, status_msg, src, pfx)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Streaming con pipes (0-RAM)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class FileProxy(io.RawIOBase):
-    """
-    Proxy para Pyrogram que simula un archivo seekable en un pipe no-seekable.
-    
-    Pyrogram valida:
-      • .file_size: tamaño total (evita "file size equals to 0 B")
-      • .size: alias de file_size
-      • __len__(): para el validador
-      • seekable() / seek(): para videos grandes
-      • read(n): para leer en chunks
-    """
-
     def __init__(self, file_obj, custom_name: str, file_size: int):
         super().__init__()
         self._file = file_obj
@@ -159,7 +123,6 @@ class FileProxy(io.RawIOBase):
         self._pos = 0
 
     def read(self, n: int = -1) -> bytes:
-        """Lee del pipe (no bloqueante)."""
         data = self._file.read(n)
         self._pos += len(data)
         return data
@@ -171,19 +134,15 @@ class FileProxy(io.RawIOBase):
         return False
 
     def seek(self, offset: int, whence: int = 0) -> int:
-        """Finge seek (necesario para videos)."""
         return 0
 
     def tell(self) -> int:
-        """Posición actual."""
         return self._pos
 
     def __len__(self) -> int:
-        """Pyrogram lo usa para validar el tamaño."""
         return self._size
 
     def close(self):
-        """Cierra el archivo."""
         try:
             self._file.close()
         except:
@@ -199,10 +158,6 @@ async def _stream_and_send(
     src: Message,
     pfx: str,
 ) -> None:
-    """
-    Descarga en un thread y sube en paralelo (ambas tareas concurrentes).
-    El pipe es el buffer — no toca disco ni RAM (mucho).
-    """
     total_size = _get_media_size(src)
     file_name = _get_media_name(src) or f"file_{src.id}"
     caption = src.caption or ""
@@ -214,15 +169,12 @@ async def _stream_and_send(
         update_interval=PROGRESS_UPDATE_INTERVAL,
     )
 
-    # Crear pipe (lectura/escritura bidireccional)
     r, w = os.pipe()
     reader_fd = os.fdopen(r, "rb", buffering=0)
     writer_fd = os.fdopen(w, "wb", buffering=0)
 
-    # Proxy para engañar a Pyrogram (que valide el tamaño antes de leer)
     proxy = FileProxy(reader_fd, file_name, total_size)
 
-    # Tarea 1: descargar desde Telegram al pipe
     async def download_task():
         try:
             async for chunk in user.stream_media(src):
@@ -239,10 +191,8 @@ async def _stream_and_send(
             except:
                 pass
 
-    # Tarea 2: subir desde el pipe a Telegram
     async def upload_task():
         try:
-            # Esperar a que el pipe tenga datos (sleep mínimo)
             await asyncio.sleep(0.5)
 
             if total_size <= 0:
@@ -260,7 +210,6 @@ async def _stream_and_send(
             except:
                 pass
 
-    # Ejecutar ambas tareas en paralelo
     try:
         await asyncio.gather(download_task(), upload_task())
         await _safe_edit(status_msg, f"{pfx}✅ `{file_name}` entregado.")
@@ -271,10 +220,6 @@ async def _stream_and_send(
         raise
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Despacho de media según tipo
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def _dispatch_media(
     bot: Client,
     chat_id: int,
@@ -282,7 +227,6 @@ async def _dispatch_media(
     fp,
     caption: str,
 ) -> None:
-    """Envía el archivo según su tipo de media."""
     kw = dict(chat_id=chat_id, caption=caption)
     media_type = src.media.value if src.media else "document"
 
@@ -300,18 +244,29 @@ async def _dispatch_media(
         await bot.send_document(document=fp, **kw)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def _get_message_with_retry(
     user: Client,
     chat_id: str,
     msg_id: int,
     max_retries: int = 3,
 ) -> Optional[Message]:
-    """Obtiene un mensaje con reintentos y logging detallado."""
-    logger.info("Intentando obtener mensaje %d del chat %s", msg_id, chat_id)
+    """
+    Obtiene un mensaje. 
+    
+    Si el chat_id es un canal privado (-100...), primero intenta
+    "conocer" el canal antes de acceder a los mensajes.
+    """
+    logger.info("Obteniendo mensaje %d del chat %s", msg_id, chat_id)
+
+    # Si es un ID numérico de canal privado, intenta hacer "join" primero
+    if isinstance(chat_id, str) and chat_id.startswith("-100"):
+        try:
+            logger.info("Pre-validando acceso al canal %s", chat_id)
+            await user.get_chat(chat_id)
+            logger.info("✅ Acceso validado al canal")
+        except Exception as e:
+            logger.warning("No se puede acceder al canal (%s): %s", type(e).__name__, e)
+            return None
 
     for attempt in range(max_retries):
         try:
@@ -325,6 +280,10 @@ async def _get_message_with_retry(
 
         except (MessageIdInvalid, ChannelPrivate) as e:
             logger.error("Error de acceso (%s): %s", type(e).__name__, e)
+            return None
+
+        except PeerIdInvalid as e:
+            logger.error("PEER_ID_INVALID — La sesión no tiene acceso a este canal. %s", e)
             return None
 
         except FloodWait as fw:
@@ -344,7 +303,6 @@ async def _get_message_with_retry(
 
 
 async def _safe_edit(msg: Message, text: str) -> None:
-    """Edita un mensaje ignorando errores."""
     try:
         await msg.edit_text(text)
     except Exception:
@@ -352,7 +310,6 @@ async def _safe_edit(msg: Message, text: str) -> None:
 
 
 def _get_media_size(msg: Message) -> int:
-    """Extrae el tamaño total del media en bytes."""
     for attr in ("video", "audio", "document", "voice", "animation"):
         obj = getattr(msg, attr, None)
         if obj and hasattr(obj, "file_size") and obj.file_size:
@@ -361,7 +318,6 @@ def _get_media_size(msg: Message) -> int:
 
 
 def _get_media_name(msg: Message) -> Optional[str]:
-    """Extrae el nombre del archivo."""
     for attr in ("video", "audio", "document", "animation"):
         obj = getattr(msg, attr, None)
         if obj and getattr(obj, "file_name", None):
